@@ -31,15 +31,36 @@ else:
 
 
 def export_model(model_id: str, subfolder: str):
+    """Download or export a single model for the detected backend."""
     from transformers import AutoProcessor
-    from optimum.intel import OVModelForSpeechSeq2Seq
     from engines.hardware import detect_hardware
 
     hw = detect_hardware()
     device = hw["selected_device"]
+    hf_token = os.getenv("HF_TOKEN")
+
+    if hw["backend"] == "cuda":
+        # CUDA: pre-download weights to HuggingFace cache (no OV conversion needed)
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq
+
+        logger.info("CUDA mode — pre-downloading %s to HuggingFace cache ...", model_id)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            dtype=torch.float16,
+            use_safetensors=True,
+            token=hf_token,
+        )
+        AutoProcessor.from_pretrained(model_id, token=hf_token)
+        del model  # free memory; weights are now in HF cache
+        logger.info("Downloaded %s — ready for CUDA inference.", model_id)
+        return
+
+    # --- OpenVINO export path ---
+    from optimum.intel.openvino import OVModelForSpeechSeq2Seq
+
     cache_dir = os.getenv("OV_CACHE_DIR", "./ov_cache")
     export_dir = os.path.join(cache_dir, subfolder)
-    hf_token = os.getenv("HF_TOKEN")
 
     if os.path.isdir(export_dir) and os.path.isfile(
         os.path.join(export_dir, "openvino_encoder_model.xml")
@@ -63,6 +84,7 @@ def export_model(model_id: str, subfolder: str):
 
 
 def main():
+    """Export all configured ASR models."""
     logger.info("=== Pre-exporting Typhoon Whisper Large v3 ===")
     export_model("typhoon-ai/typhoon-whisper-large-v3", "typhoon")
 

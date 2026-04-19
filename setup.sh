@@ -24,6 +24,11 @@ pip install openvino==2026.1.0
 echo "[5/5] Installing remaining dependencies..."
 pip install -r requirements.txt
 
+# torchcodec is incompatible on Windows without FFmpeg full-shared DLLs.
+# Transformers 4.57+ tries to import it for ASR pipelines; remove it so
+# transformers falls back to soundfile/librosa (which works correctly).
+pip uninstall torchcodec -y 2>/dev/null || true
+
 echo
 echo "============================================"
 echo " Setup complete!"

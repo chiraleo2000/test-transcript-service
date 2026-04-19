@@ -31,60 +31,76 @@ logger = logging.getLogger(__name__)
 # (common on Windows when installed via winget into a user-local folder)
 # ---------------------------------------------------------------------------
 
+_FFMPEG_EXE_NAME = "ffmpeg.exe"
+
+
+def _locate_ffmpeg_in_registry() -> str | None:
+    """Search Windows registry PATH for ffmpeg."""
+    import winreg
+
+    paths = []
+    for hive, subkey in [
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, r"Environment"),
+    ]:
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                val, _ = winreg.QueryValueEx(key, "Path")
+                paths.append(val)
+        except FileNotFoundError:
+            pass
+
+    registry_path = os.pathsep.join(paths)
+    found = shutil.which("ffmpeg", path=registry_path)
+    if found:
+        os.environ["PATH"] = registry_path + os.pathsep + os.environ.get("PATH", "")
+        logger.info("ffmpeg found via registry PATH: %s", found)
+    return found
+
+
+def _locate_ffmpeg_via_scan() -> str | None:
+    """Scan common Windows install locations for ffmpeg."""
+    candidates = [
+        os.path.expanduser(r"~\AppData\Local\Microsoft\WinGet\Packages"),
+        r"C:\ProgramData\chocolatey\bin",
+        os.path.expanduser(r"~\scoop\shims"),
+        r"C:\ffmpeg\bin",
+        r"C:\tools\ffmpeg\bin",
+    ]
+    for base in candidates:
+        for pattern in [
+            os.path.join(base, _FFMPEG_EXE_NAME),
+            os.path.join(base, "*", "bin", _FFMPEG_EXE_NAME),
+            os.path.join(base, "*", "*", "bin", _FFMPEG_EXE_NAME),
+        ]:
+            matches = glob.glob(pattern)
+            if matches:
+                found = matches[0]
+                bin_dir = os.path.dirname(found)
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+                logger.info("ffmpeg found via scan: %s", found)
+                return found
+    return None
+
+
 def _locate_ffmpeg() -> str | None:
     """Return absolute path to ffmpeg executable, or None if not found."""
-    # 1. Already on PATH
     found = shutil.which("ffmpeg")
     if found:
         return found
 
-    # 2. Read the real system + user PATH from the Windows registry so we pick
-    #    up paths that were added after this Python process started.
     if sys.platform == "win32":
         try:
-            import winreg
-            paths = []
-            for hive, subkey in [
-                (winreg.HKEY_LOCAL_MACHINE,
-                 r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-                (winreg.HKEY_CURRENT_USER, r"Environment"),
-            ]:
-                try:
-                    with winreg.OpenKey(hive, subkey) as key:
-                        val, _ = winreg.QueryValueEx(key, "Path")
-                        paths.append(val)
-                except FileNotFoundError:
-                    pass
-            registry_path = os.pathsep.join(paths)
-            found = shutil.which("ffmpeg", path=registry_path)
+            found = _locate_ffmpeg_in_registry()
             if found:
-                os.environ["PATH"] = registry_path + os.pathsep + os.environ.get("PATH", "")
-                logger.info("ffmpeg found via registry PATH: %s", found)
                 return found
-        except Exception as exc:
+        except OSError as exc:
             logger.debug("Registry PATH scan failed: %s", exc)
 
-        # 3. Scan common winget / chocolatey / scoop install locations
-        candidates = [
-            os.path.expanduser(r"~\AppData\Local\Microsoft\WinGet\Packages"),
-            r"C:\ProgramData\chocolatey\bin",
-            os.path.expanduser(r"~\scoop\shims"),
-            r"C:\ffmpeg\bin",
-            r"C:\tools\ffmpeg\bin",
-        ]
-        for base in candidates:
-            for pattern in [
-                os.path.join(base, "ffmpeg.exe"),
-                os.path.join(base, "*", "bin", "ffmpeg.exe"),
-                os.path.join(base, "*", "*", "bin", "ffmpeg.exe"),
-            ]:
-                matches = glob.glob(pattern)
-                if matches:
-                    found = matches[0]
-                    bin_dir = os.path.dirname(found)
-                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
-                    logger.info("ffmpeg found via scan: %s", found)
-                    return found
+        found = _locate_ffmpeg_via_scan()
+        if found:
+            return found
 
     return None
 
@@ -123,7 +139,7 @@ def _ffmpeg_stage(audio_path: str, out_path: str) -> bool:
     ]
     logger.debug("ffmpeg stage: %s", " ".join(cmd))
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
         if result.returncode != 0:
             logger.error("ffmpeg stage failed (rc=%d): %s", result.returncode, result.stderr[-600:])
             return False
@@ -131,7 +147,7 @@ def _ffmpeg_stage(audio_path: str, out_path: str) -> bool:
     except subprocess.TimeoutExpired:
         logger.error("ffmpeg stage timed out.")
         return False
-    except Exception as exc:
+    except (subprocess.SubprocessError, OSError) as exc:
         logger.error("ffmpeg stage error: %s", exc)
         return False
 
@@ -159,7 +175,7 @@ def _noisereduce_stage(wav_path: str, out_path: str) -> bool:
         )
         sf.write(out_path, reduced, sr, subtype="PCM_16")
         return True
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         logger.error("noisereduce stage error: %s", exc)
         return False
 
@@ -184,7 +200,7 @@ def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
             Limiter(threshold_db=-1.0, release_ms=50.0),
         ])
 
-        with AudioFile(wav_path) as f:
+        with AudioFile(wav_path) as f:  # pylint: disable=not-context-manager
             audio = f.read(f.frames)
             sr = f.samplerate
 
@@ -196,11 +212,11 @@ def _pedalboard_stage(wav_path: str, out_path: str) -> bool:
         if 0.001 < peak < 0.1:  # only boost genuinely quiet recordings
             processed = processed * (0.1 / peak)
 
-        with AudioFile(out_path, "w", samplerate=sr, num_channels=processed.shape[0]) as f:
+        with AudioFile(out_path, "w", samplerate=sr, num_channels=processed.shape[0]) as f:  # pylint: disable=not-context-manager
             f.write(processed)
 
         return True
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         logger.error("pedalboard stage error: %s", exc)
         return False
 

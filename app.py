@@ -17,8 +17,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 import gradio as gr
+from gradio.themes import Soft as _SoftTheme
 
 from engines.hardware import detect_hardware, hardware_summary
+
+# ---------------------------------------------------------------------------
+# Engine name / label constants  (avoid duplicating literals)
+# ---------------------------------------------------------------------------
+
+ENGINE_AZURE = "Azure Speech"
+ENGINE_TYPHOON = "Typhoon Whisper"
+ENGINE_THONBURIAN = "Thonburian Whisper"
+LABEL_ELAPSED = "Elapsed Time"
+LABEL_DOWNLOAD = "Download .txt"
+
+ALL_ENGINES = [ENGINE_AZURE, ENGINE_TYPHOON, ENGINE_THONBURIAN]
 
 # ---------------------------------------------------------------------------
 # Language mapping
@@ -78,11 +91,13 @@ def _preload_models():
 
     t1 = threading.Thread(target=load_typhoon, daemon=True)
     t2 = threading.Thread(target=load_thonburian, daemon=True)
+    # Load sequentially — concurrent from_pretrained with sharded
+    # checkpoints can leave meta tensors due to shared global state.
     t1.start()
+    t1.join()
     t2.start()
 
     def _wait_for_both():
-        t1.join()
         t2.join()
         _models_ready.set()
         logger.info("All models ready.")
@@ -93,15 +108,25 @@ def _preload_models():
 def _get_load_status() -> str:
     """Return current model loading status as markdown."""
     if _SKIP_LOCAL:
-        return "### Azure-Only Mode (SKIP_LOCAL_MODELS=1)\n- Typhoon Whisper: skipped\n- Thonburian Whisper: skipped\n- Azure Speech: ready"
+        return (
+            f"### Azure-Only Mode (SKIP_LOCAL_MODELS=1)\n"
+            f"- {ENGINE_TYPHOON}: skipped\n"
+            f"- {ENGINE_THONBURIAN}: skipped\n"
+            f"- {ENGINE_AZURE}: ready"
+        )
     ty = _load_status["typhoon"]
     th = _load_status["thonburian"]
     ready = _models_ready.is_set()
     if ready and ty == "ready" and th == "ready":
-        return "### All Models Ready\n- Typhoon Whisper: ready\n- Thonburian Whisper: ready\n- Azure Speech: ready"
+        return (
+            "### All Models Ready\n"
+            f"- {ENGINE_TYPHOON}: ready\n"
+            f"- {ENGINE_THONBURIAN}: ready\n"
+            f"- {ENGINE_AZURE}: ready"
+        )
     lines = ["### Loading Models..."]
-    lines.append(f"- Typhoon Whisper: **{ty}**")
-    lines.append(f"- Thonburian Whisper: **{th}**")
+    lines.append(f"- {ENGINE_TYPHOON}: **{ty}**")
+    lines.append(f"- {ENGINE_THONBURIAN}: **{th}**")
     if not ready:
         lines.append("\n*Audio upload will be enabled once both models are loaded.*")
     return "\n".join(lines)
@@ -111,74 +136,166 @@ def _get_load_status() -> str:
 # Engine dispatch helpers
 # ---------------------------------------------------------------------------
 
-def _run_azure(audio_path: str, language: str, min_speakers: int, max_speakers: int) -> tuple[str, float]:
+def _run_azure(
+    audio_path: str, language: str,
+    min_speakers: int, max_speakers: int,
+    diar_segments: list | None = None,  # unused — Azure handles diarization natively
+) -> tuple[str, float]:
     from engines.azure_asr import transcribe_azure
     azure_lang = LANGUAGES.get(language, LANGUAGES["Thai"])["azure"]
     t0 = time.perf_counter()
-    text = transcribe_azure(audio_path, language=azure_lang, min_speakers=min_speakers, max_speakers=max_speakers)
+    text = transcribe_azure(
+        audio_path, language=azure_lang,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+    )
     elapsed = time.perf_counter() - t0
     return text, elapsed
 
 
-def _run_typhoon(audio_path: str, language: str, min_speakers: int, max_speakers: int) -> tuple[str, float]:
+def _run_typhoon(
+    audio_path: str, language: str,
+    min_speakers: int, max_speakers: int,
+    diar_segments: list | None = None,
+) -> tuple[str, float]:
     if _SKIP_LOCAL:
-        return "(Typhoon skipped — set SKIP_LOCAL_MODELS=0 and restart after models are downloaded)", 0.0
+        return (
+            "(Typhoon skipped — set SKIP_LOCAL_MODELS=0"
+            " and restart after models are downloaded)", 0.0,
+        )
     from engines.typhoon_asr import transcribe_typhoon
     whisper_lang = LANGUAGES.get(language, LANGUAGES["Thai"])["whisper"]
     t0 = time.perf_counter()
-    text = transcribe_typhoon(audio_path, language=whisper_lang, min_speakers=min_speakers, max_speakers=max_speakers)
+    text = transcribe_typhoon(
+        audio_path, language=whisper_lang,
+        diarization_segments=diar_segments,
+    )
     elapsed = time.perf_counter() - t0
     return text, elapsed
 
 
-def _run_thonburian(audio_path: str, language: str, min_speakers: int, max_speakers: int) -> tuple[str, float]:
+def _run_thonburian(
+    audio_path: str, language: str,
+    min_speakers: int, max_speakers: int,
+    diar_segments: list | None = None,
+) -> tuple[str, float]:
     if _SKIP_LOCAL:
-        return "(Thonburian skipped — set SKIP_LOCAL_MODELS=0 and restart after models are downloaded)", 0.0
+        return (
+            "(Thonburian skipped — set SKIP_LOCAL_MODELS=0"
+            " and restart after models are downloaded)", 0.0,
+        )
     from engines.thonburian_asr import transcribe_thonburian
     whisper_lang = LANGUAGES.get(language, LANGUAGES["Thai"])["whisper"]
     t0 = time.perf_counter()
-    text = transcribe_thonburian(audio_path, language=whisper_lang, min_speakers=min_speakers, max_speakers=max_speakers)
+    text = transcribe_thonburian(
+        audio_path, language=whisper_lang,
+        diarization_segments=diar_segments,
+    )
     elapsed = time.perf_counter() - t0
     return text, elapsed
 
+
+# Map engine names → runner functions
+_ENGINE_RUNNERS: dict = {
+    ENGINE_AZURE: _run_azure,
+    ENGINE_TYPHOON: _run_typhoon,
+    ENGINE_THONBURIAN: _run_thonburian,
+}
 
 # ---------------------------------------------------------------------------
 # Main transcription callback
 # ---------------------------------------------------------------------------
 
-def transcribe(audio_path, selected_engines, language, diarization, min_speakers, max_speakers, enhance):
-    """Run selected ASR engines in parallel threads and return results."""
+
+def _save_transcript(engine_name: str, text: str) -> str | None:
+    """Write transcript to a temp .txt file and return its path."""
+    import tempfile
+    if not text or text.startswith(("(", "ERROR")):
+        return None
+    safe_name = engine_name.replace(" ", "_")
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False,
+            prefix=f"{safe_name}_transcript_", encoding="utf-8",
+        )
+        tmp.write(text)
+        tmp.close()
+        return tmp.name
+    except OSError:
+        return None
+
+
+def _build_outputs(results: dict, selected_engines: list) -> tuple:
+    """Build flat (text, elapsed, download_update, ...) tuple for all engine tabs."""
+    outputs = []
+    for engine_name in ALL_ENGINES:
+        if engine_name in results:
+            text, elapsed = results[engine_name]
+            fpath = _save_transcript(engine_name, text)
+            outputs.extend([
+                text,
+                f"{elapsed:.2f}s",
+                gr.update(value=fpath, interactive=fpath is not None),
+            ])
+        elif engine_name in selected_engines:
+            outputs.extend(["(failed)", "", gr.update(value=None, interactive=False)])
+        else:
+            outputs.extend(["", "(not selected)", gr.update(value=None, interactive=False)])
+    return tuple(outputs)
+
+def transcribe(
+    audio_path, selected_engines, language,
+    diarization, min_speakers, max_speakers, enhance,
+):
+    """Run selected ASR engines in parallel and return results."""
     if not audio_path:
         empty = "(no audio provided)"
-        return empty, "", empty, "", empty, ""
+        _no_dl = gr.update(value=None, interactive=False)
+        return empty, "", _no_dl, empty, "", _no_dl, empty, "", _no_dl
 
     if not _models_ready.is_set():
         msg = "Models are still loading, please wait..."
-        return msg, "", msg, "", msg, ""
+        _no_dl = gr.update(value=None, interactive=False)
+        return msg, "", _no_dl, msg, "", _no_dl, msg, "", _no_dl
 
-    # Use enhanced audio if enhancement is enabled
     process_path = audio_path
     if enhance:
         from engines.preprocess import preprocess_audio
         process_path = preprocess_audio(audio_path)
 
-    # Pass min/max speakers to engines (0 = disabled / auto)
     n_min = int(min_speakers) if diarization else 0
     n_max = int(max_speakers) if diarization else 0
 
+    # Run pyannote diarization ONCE (before ASR threads) so both open-ASR
+    # engines share the same result without a thread-safety race.
+    # NOTE: n_min/n_max may both be 0 = auto mode — that is valid and must run.
+    diar_segments: list | None = None
+    open_asr_selected = any(
+        e in selected_engines for e in [ENGINE_TYPHOON, ENGINE_THONBURIAN]
+    )
+    if diarization and open_asr_selected:
+        try:
+            from engines.diarization import diarize
+            logger.info(
+                "Running speaker diarization (min=%d, max=%d)...", n_min, n_max,
+            )
+            diar_segments = diarize(
+                process_path, min_speakers=n_min, max_speakers=n_max,
+            )
+            logger.info(
+                "Diarization complete: %d segments.", len(diar_segments),
+            )
+        except Exception as exc:
+            logger.error("Diarization failed: %s", exc, exc_info=True)
+            # Continue without diarization rather than aborting all engines
+
     results: dict[str, tuple[str, float]] = {}
 
-    # Run all selected engines in parallel threads
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {}
-        for name in selected_engines:
-            if name == "Azure Speech":
-                futures[pool.submit(_run_azure, process_path, language, n_min, n_max)] = name
-            elif name == "Typhoon Whisper":
-                futures[pool.submit(_run_typhoon, process_path, language, n_min, n_max)] = name
-            elif name == "Thonburian Whisper":
-                futures[pool.submit(_run_thonburian, process_path, language, n_min, n_max)] = name
-
+        futures = {
+            pool.submit(runner, process_path, language, n_min, n_max, diar_segments): name
+            for name in selected_engines
+            if (runner := _ENGINE_RUNNERS.get(name)) is not None
+        }
         for future in as_completed(futures):
             name = futures[future]
             try:
@@ -189,21 +306,7 @@ def transcribe(audio_path, selected_engines, language, diarization, min_speakers
                 results[name] = (f"ERROR: {exc}", 0.0)
                 logger.error("%s failed: %s", name, exc, exc_info=True)
 
-    # Build outputs: (transcript, timing) for each tab
-    outputs = []
-    for engine_name in ["Azure Speech", "Typhoon Whisper", "Thonburian Whisper"]:
-        if engine_name in results:
-            text, elapsed = results[engine_name]
-            outputs.append(text)
-            outputs.append(f"{elapsed:.2f}s")
-        elif engine_name in selected_engines:
-            outputs.append("(failed)")
-            outputs.append("")
-        else:
-            outputs.append("")
-            outputs.append("(not selected)")
-
-    return tuple(outputs)
+    return _build_outputs(results, selected_engines)
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +314,15 @@ def transcribe(audio_path, selected_engines, language, diarization, min_speakers
 # ---------------------------------------------------------------------------
 
 def build_ui() -> gr.Blocks:
+    """Construct the Gradio UI."""  # pylint: disable=too-many-locals
     hw_md = hardware_summary()
 
-    with gr.Blocks(title="Simple Transcription Service") as app:
+    with gr.Blocks(title="Simple Transcription Service") as demo:
         gr.Markdown("# Simple Transcription Service")
-        gr.Markdown("Upload or record audio, then transcribe with one or more ASR engines in parallel.")
+        gr.Markdown(
+            "Upload or record audio, then transcribe "
+            "with one or more ASR engines in parallel."
+        )
 
         # Model loading status — updated by Timer below
         load_status = gr.Markdown(_get_load_status())
@@ -236,8 +343,8 @@ def build_ui() -> gr.Blocks:
                     label="Language",
                 )
                 engine_selector = gr.CheckboxGroup(
-                    choices=["Azure Speech", "Typhoon Whisper", "Thonburian Whisper"],
-                    value=["Azure Speech", "Typhoon Whisper", "Thonburian Whisper"],
+                    choices=ALL_ENGINES,
+                    value=ALL_ENGINES,
                     label="Select Engines",
                 )
                 enhance = gr.Checkbox(
@@ -263,7 +370,7 @@ def build_ui() -> gr.Blocks:
                 )
 
         # Show/hide speaker sliders based on diarization checkbox
-        diarization.change(
+        diarization.change(  # pylint: disable=no-member
             fn=lambda d: gr.update(visible=d),
             inputs=[diarization],
             outputs=[speakers_row],
@@ -283,7 +390,7 @@ def build_ui() -> gr.Blocks:
                 )
 
         # Mirror uploaded audio into the Original player immediately
-        audio_input.change(
+        audio_input.change(  # pylint: disable=no-member
             fn=lambda a: a,
             inputs=[audio_input],
             outputs=[audio_original],
@@ -296,14 +403,14 @@ def build_ui() -> gr.Blocks:
             from engines.preprocess import preprocess_audio
             return preprocess_audio(audio_path)
 
-        enhance.change(
+        enhance.change(  # pylint: disable=no-member
             fn=_run_enhance,
             inputs=[audio_input, enhance],
             outputs=[audio_enhanced],
         )
 
         # Also run preprocessing when new audio is uploaded (if enhancement is ON)
-        audio_input.change(
+        audio_input.change(  # pylint: disable=no-member
             fn=_run_enhance,
             inputs=[audio_input, enhance],
             outputs=[audio_enhanced],
@@ -311,28 +418,64 @@ def build_ui() -> gr.Blocks:
 
         # Tabbed output — one tab per engine
         with gr.Tabs():
-            with gr.TabItem("Azure Speech"):
-                azure_text = gr.Textbox(label="Transcript", lines=10, interactive=False)
-                azure_time = gr.Textbox(label="Elapsed Time", interactive=False, max_lines=1)
+            with gr.TabItem(ENGINE_AZURE):
+                azure_text = gr.Textbox(
+                    label="Transcript", lines=20, max_lines=200,
+                    buttons=["copy"], interactive=False,
+                )
+                with gr.Row():
+                    azure_time = gr.Textbox(
+                        label=LABEL_ELAPSED, interactive=False,
+                        max_lines=1, scale=3,
+                    )
+                    azure_dl = gr.DownloadButton(
+                        label=LABEL_DOWNLOAD, value=None,
+                        scale=1, visible=True, interactive=False,
+                    )
 
-            with gr.TabItem("Typhoon Whisper"):
-                typhoon_text = gr.Textbox(label="Transcript", lines=10, interactive=False)
-                typhoon_time = gr.Textbox(label="Elapsed Time", interactive=False, max_lines=1)
+            with gr.TabItem(ENGINE_TYPHOON):
+                typhoon_text = gr.Textbox(
+                    label="Transcript", lines=20, max_lines=200,
+                    buttons=["copy"], interactive=False,
+                )
+                with gr.Row():
+                    typhoon_time = gr.Textbox(
+                        label=LABEL_ELAPSED, interactive=False,
+                        max_lines=1, scale=3,
+                    )
+                    typhoon_dl = gr.DownloadButton(
+                        label=LABEL_DOWNLOAD, value=None,
+                        scale=1, visible=True, interactive=False,
+                    )
 
-            with gr.TabItem("Thonburian Whisper"):
-                thonburian_text = gr.Textbox(label="Transcript", lines=10, interactive=False)
-                thonburian_time = gr.Textbox(label="Elapsed Time", interactive=False, max_lines=1)
+            with gr.TabItem(ENGINE_THONBURIAN):
+                thonburian_text = gr.Textbox(
+                    label="Transcript", lines=20, max_lines=200,
+                    buttons=["copy"], interactive=False,
+                )
+                with gr.Row():
+                    thonburian_time = gr.Textbox(
+                        label=LABEL_ELAPSED, interactive=False,
+                        max_lines=1, scale=3,
+                    )
+                    thonburian_dl = gr.DownloadButton(
+                        label=LABEL_DOWNLOAD, value=None,
+                        scale=1, visible=True, interactive=False,
+                    )
 
         gr.Markdown(hw_md)
 
         # Wire up transcribe button
-        transcribe_btn.click(
+        transcribe_btn.click(  # pylint: disable=no-member
             fn=transcribe,
-            inputs=[audio_input, engine_selector, language, diarization, min_speakers, max_speakers, enhance],
+            inputs=[
+                audio_input, engine_selector, language,
+                diarization, min_speakers, max_speakers, enhance,
+            ],
             outputs=[
-                azure_text, azure_time,
-                typhoon_text, typhoon_time,
-                thonburian_text, thonburian_time,
+                azure_text, azure_time, azure_dl,
+                typhoon_text, typhoon_time, typhoon_dl,
+                thonburian_text, thonburian_time, thonburian_dl,
             ],
         )
 
@@ -347,16 +490,42 @@ def build_ui() -> gr.Blocks:
                 gr.update(interactive=ready),  # transcribe_btn
             )
 
-        timer.tick(
+        timer.tick(  # pylint: disable=no-member
             fn=check_ready,
             outputs=[load_status, audio_input, transcribe_btn],
         )
 
-    return app
+    return demo
 
 
 if __name__ == "__main__":
+    # --- Startup resource check ---
+    hw = detect_hardware()
+    logger.info("=" * 60)
+    logger.info("RESOURCE CHECK")
+    logger.info("  Torch      : %s", hw["torch_version"] or "NOT INSTALLED")
+    logger.info(
+        "  CUDA       : %s",
+        f"{hw['cuda_device_name']} ({hw['cuda_vram_mb']} MB)"
+        if hw["cuda"] else "not available",
+    )
+    logger.info(
+        "  OpenVINO   : %s",
+        hw["openvino_version"] or "not installed",
+    )
+    logger.info(
+        "  OV Devices : %s",
+        ", ".join(hw["available_devices"]) or "none",
+    )
+    logger.info("  FFmpeg     : %s", hw["ffmpeg"] or "NOT FOUND")
+    logger.info("  Backend    : %s", hw["backend"].upper())
+    logger.info("  Device     : %s", hw["selected_device"])
+    logger.info("=" * 60)
+
     # Start model preloading before UI launches
     _preload_models()
-    app = build_ui()
-    app.launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft())
+    application = build_ui()
+    application.launch(
+        server_name="0.0.0.0", server_port=7860,
+        max_threads=40, theme=_SoftTheme(),
+    )

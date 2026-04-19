@@ -29,6 +29,11 @@ REM Step 5: Install remaining dependencies
 echo [5/5] Installing remaining dependencies...
 pip install -r requirements.txt
 
+REM torchcodec is incompatible on Windows without FFmpeg full-shared DLLs.
+REM Transformers 4.57+ tries to import it for ASR pipelines; remove it so
+REM transformers falls back to soundfile/librosa (which works correctly).
+pip uninstall torchcodec -y 2>nul
+
 echo.
 echo ============================================
 echo  Setup complete!

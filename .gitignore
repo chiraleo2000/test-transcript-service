@@ -1,6 +1,7 @@
 venv/
 .env
 ov_cache/
+hf_cache/
 __pycache__/
 *.pyc
 *.pyo
