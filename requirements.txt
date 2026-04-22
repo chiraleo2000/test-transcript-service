@@ -12,3 +12,4 @@ noisereduce>=3.0
 librosa
 soundfile
 python-dotenv
+openai>=1.0.0

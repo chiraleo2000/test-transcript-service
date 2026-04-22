@@ -4,6 +4,20 @@ import logging
 import os
 import re
 import shutil
+import warnings
+
+# Suppress torchcodec DLL probe warnings emitted when torch imports its video
+# codec library and none of the bundled FFmpeg shared libs can be loaded.
+# These are purely informational — our pipeline uses librosa, not torchcodec.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchcodec.*|.*libtorchcodec.*|.*FFmpeg.*version.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*TensorFloat-32.*|.*TF32.*",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -11,8 +25,10 @@ MODEL_ID = "pyannote/speaker-diarization-community-1"
 
 _pipeline_cache: list = []
 
+_NO_SPEECH = "(no speech detected)"
 
-def _fmt_ts(seconds: float) -> str:
+
+def _fmt_ts(seconds: float | None) -> str:
     """Format seconds as HH:MM:SS."""
     if seconds is None or seconds < 0:
         return "00:00:00"
@@ -44,6 +60,8 @@ def _get_diarization_pipeline():
     logger.info("Loading pyannote speaker diarization pipeline (%s)...", MODEL_ID)
 
     pipeline = Pipeline.from_pretrained(MODEL_ID, token=hf_token)
+    if pipeline is None:
+        raise RuntimeError(f"Failed to load pyannote pipeline '{MODEL_ID}'")
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     pipeline = pipeline.to(device)
     _pipeline_cache.append(pipeline)
@@ -185,6 +203,40 @@ def _estimate_chunk_ts(
     return c_start, c_end
 
 
+def _ts_is_none(ts) -> bool:
+    """Return True when a Whisper timestamp value is effectively absent.
+
+    Handles both the plain ``None`` case and the ``(None, None)`` / ``(None, end)``
+    tuple that some transformers versions emit when return_timestamps is not
+    fully honoured.
+    """
+    if ts is None:
+        return True
+    if isinstance(ts, (tuple, list)) and len(ts) == 2 and ts[0] is None:
+        return True
+    return False
+
+
+def _format_plain(chunks: list[dict]) -> str:
+    """Format Whisper chunks as plain timestamped lines with no speaker labels.
+
+    Used as fallback when diarization_segments is empty.
+    """
+    lines = []
+    for chunk in chunks:
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+        ts = chunk.get("timestamp")
+        c_start = ts[0] if (ts and ts[0] is not None) else None
+        c_end = ts[1] if (ts and len(ts) > 1 and ts[1] is not None) else None
+        if c_start is not None:
+            lines.append(f"[{_fmt_ts(c_start)} \u2192 {_fmt_ts(c_end)}] {text}")
+        else:
+            lines.append(text)
+    return "\n".join(lines) if lines else _NO_SPEECH
+
+
 def _iter_chunks(
     chunks: list[dict],
     diarization_segments: list[dict],
@@ -199,7 +251,10 @@ def _iter_chunks(
         if not text:
             continue
         ts = chunk.get("timestamp")
-        c_start, c_end = ts if ts else (None, None)
+        if ts is not None and not _ts_is_none(ts):
+            c_start, c_end = ts[0], ts[1]
+        else:
+            c_start, c_end = None, None
         if all_ts_none and total_dur > 0 and total_chunks > 0:
             c_start, c_end = _estimate_chunk_ts(chunk_idx, total_chunks, total_dur)
         speaker = _find_speaker(c_start, c_end, diarization_segments)
@@ -218,14 +273,20 @@ def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
     """
     chunks = result.get("chunks", [])
     if not chunks:
-        return result.get("text", "").strip() or "(no speech detected)"
+        return result.get("text", "").strip() or _NO_SPEECH
+
+    # When no diarization segments are available (e.g. diarize() returned an
+    # empty list), fall back to plain timestamped format without speaker labels.
+    if not diarization_segments:
+        return _format_plain(chunks)
 
     # When return_timestamps=True is not honoured (transformers regression),
-    # ALL chunks arrive with timestamp=None.  Detect this upfront and fall
-    # back to position-based estimation so speaker attribution still works.
+    # ALL chunks arrive with timestamp=None or (None,None).  Detect this
+    # upfront and fall back to position-based estimation so speaker
+    # attribution still works.
     non_empty = [c for c in chunks if c.get("text", "").strip()]
     total_chunks = len(non_empty)
-    all_ts_none = all(c.get("timestamp") is None for c in non_empty)
+    all_ts_none = all(_ts_is_none(c.get("timestamp")) for c in non_empty)
     total_dur = diarization_segments[-1]["end"] if diarization_segments else 0.0
 
     lines: list[str] = []
@@ -250,4 +311,4 @@ def assign_speakers(result: dict, diarization_segments: list[dict]) -> str:
         group_end = c_end
 
     _flush_speaker_group(lines, current_speaker, current_words, group_start, group_end)
-    return "\n".join(lines) if lines else "(no speech detected)"
+    return "\n".join(lines) if lines else _NO_SPEECH

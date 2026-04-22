@@ -2,9 +2,60 @@
 
 import logging
 import os
+import sys
 import time
 import threading
+import types
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---------------------------------------------------------------------------
+# Install a lightweight torchcodec stub BEFORE anything imports it.
+#
+# torchcodec ships with PyTorch 2.11+ but requires FFmpeg "full-shared" DLLs
+# that are not present on this Windows system.  Any `import torchcodec`
+# (from transformers ASR pipeline *or* pyannote audio I/O) triggers a
+# RuntimeError when loading the native library.
+#
+# By placing a stub in sys.modules the `import torchcodec` inside
+# transformers (line 381 of automatic_speech_recognition.py) succeeds, but
+# isinstance(input, torchcodec.decoders.AudioDecoder) returns False for our
+# dict input, so the code falls through to the normal dict handling branch.
+# Pyannote's io.py also sees a working import and skips its noisy warning.
+# ---------------------------------------------------------------------------
+if "torchcodec" not in sys.modules:
+    import importlib.machinery
+    _tc = types.ModuleType("torchcodec")
+    _tc.__spec__ = importlib.machinery.ModuleSpec("torchcodec", None)
+    _tc_decoders = types.ModuleType("torchcodec.decoders")
+    setattr(_tc_decoders, "AudioDecoder", type("AudioDecoder", (), {}))
+    setattr(_tc, "decoders", _tc_decoders)
+    _tc_encoders = types.ModuleType("torchcodec.encoders")
+    setattr(_tc, "encoders", _tc_encoders)
+    _tc_samplers = types.ModuleType("torchcodec.samplers")
+    setattr(_tc, "samplers", _tc_samplers)
+    _tc_transforms = types.ModuleType("torchcodec.transforms")
+    setattr(_tc, "transforms", _tc_transforms)
+    for _name, _mod in [
+        ("torchcodec", _tc),
+        ("torchcodec.decoders", _tc_decoders),
+        ("torchcodec.encoders", _tc_encoders),
+        ("torchcodec.samplers", _tc_samplers),
+        ("torchcodec.transforms", _tc_transforms),
+    ]:
+        _mod.__spec__ = _mod.__spec__ or importlib.machinery.ModuleSpec(_name, None)
+        sys.modules[_name] = _mod
+
+# Suppress residual torchcodec / TF32 warnings
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torchcodec.*|.*libtorchcodec.*|.*FFmpeg.*version.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*TensorFloat-32.*|.*TF32.*",
+)
 
 from dotenv import load_dotenv
 
@@ -310,6 +361,85 @@ def transcribe(
 
 
 # ---------------------------------------------------------------------------
+# Combine & Correct handler
+# ---------------------------------------------------------------------------
+
+def run_combine(
+    azure_text: str,
+    typhoon_text: str,
+    thonburian_text: str,
+    typhoon_cb: bool,
+    thonburian_cb: bool,
+    progress=gr.Progress(),
+):
+    """Combine and LLM-correct selected transcripts with GPT-5.4-nano."""
+    # Validate API key
+    api_key = os.getenv("AZURE_OPENAI_KEY", "").strip()
+    endpoint = os.getenv("AZURE_ENDPOINT", "").strip()
+    if not api_key or not endpoint:
+        missing = []
+        if not api_key:
+            missing.append("AZURE_OPENAI_KEY")
+        if not endpoint:
+            missing.append("AZURE_ENDPOINT")
+        return (
+            f"ERROR: {', '.join(missing)} not found. "
+            "Please add them to your .env file and restart.",
+            "",
+            gr.update(value=None, interactive=False),
+        )
+
+    # Validate Azure transcript
+    if not azure_text or azure_text.startswith(("(", "ERROR")):
+        return (
+            "ERROR: Azure Speech transcript is required. "
+            "Please run transcription with Azure Speech engine first.",
+            "",
+            gr.update(value=None, interactive=False),
+        )
+
+    # Validate at least one Whisper source is selected
+    selected = []
+    if typhoon_cb:
+        selected.append("typhoon")
+    if thonburian_cb:
+        selected.append("thonburian")
+
+    if not selected:
+        return (
+            "ERROR: Please check at least one Whisper engine result "
+            "(Typhoon or Thonburian) to include in the combination.",
+            "",
+            gr.update(value=None, interactive=False),
+        )
+
+    transcripts = {
+        "azure":      azure_text,
+        "typhoon":    typhoon_text if typhoon_cb else None,
+        "thonburian": thonburian_text if thonburian_cb else None,
+    }
+
+    try:
+        from engines.llm_combine import combine_and_correct
+        combined, elapsed = combine_and_correct(
+            transcripts, selected, progress=progress,
+        )
+        fpath = _save_transcript("Combined", combined)
+        return (
+            combined,
+            f"{elapsed:.2f}s",
+            gr.update(value=fpath, interactive=fpath is not None),
+        )
+    except Exception as exc:
+        logger.error("Combine failed: %s", exc, exc_info=True)
+        return (
+            f"ERROR: {exc}",
+            "",
+            gr.update(value=None, interactive=False),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -447,6 +577,11 @@ def build_ui() -> gr.Blocks:
                         label=LABEL_DOWNLOAD, value=None,
                         scale=1, visible=True, interactive=False,
                     )
+                typhoon_combine_cb = gr.Checkbox(
+                    label="Include Typhoon in Combine & Correction",
+                    value=False,
+                    info="Check to include this result when combining with GPT-5.4-nano below.",
+                )
 
             with gr.TabItem(ENGINE_THONBURIAN):
                 thonburian_text = gr.Textbox(
@@ -462,6 +597,46 @@ def build_ui() -> gr.Blocks:
                         label=LABEL_DOWNLOAD, value=None,
                         scale=1, visible=True, interactive=False,
                     )
+                thonburian_combine_cb = gr.Checkbox(
+                    label="Include Thonburian in Combine & Correction",
+                    value=False,
+                    info="Check to include this result when combining with GPT-5.4-nano below.",
+                )
+
+        # -------------------------------------------------------------------
+        # Combine & Correct section
+        # -------------------------------------------------------------------
+        gr.Markdown("---")
+        gr.Markdown("## Combine & Correct Transcripts")
+        gr.Markdown(
+            "Select which Whisper engine results to combine with the **Azure Speech** transcript "
+            "(Azure is always the time-grid baseline and is required). "
+            "The selected transcripts are sent to **GPT-5.4-nano** in a single call "
+            "for cross-engine correction.  "
+            "Requires `AZURE_OPENAI_KEY` in your `.env` file."
+        )
+
+        combine_btn = gr.Button(
+            "Combine & Correct with GPT-5.4-nano",
+            variant="primary",
+            size="lg",
+        )
+
+        with gr.Group():
+            combined_text = gr.Textbox(
+                label="Combined & Corrected Transcript",
+                lines=20, max_lines=200,
+                buttons=["copy"], interactive=False,
+            )
+            with gr.Row():
+                combined_time = gr.Textbox(
+                    label=LABEL_ELAPSED, interactive=False,
+                    max_lines=1, scale=3,
+                )
+                combined_dl = gr.DownloadButton(
+                    label=LABEL_DOWNLOAD, value=None,
+                    scale=1, visible=True, interactive=False,
+                )
 
         gr.Markdown(hw_md)
 
@@ -479,6 +654,16 @@ def build_ui() -> gr.Blocks:
             ],
         )
 
+        # Wire up combine button
+        combine_btn.click(  # pylint: disable=no-member
+            fn=run_combine,
+            inputs=[
+                azure_text, typhoon_text, thonburian_text,
+                typhoon_combine_cb, thonburian_combine_cb,
+            ],
+            outputs=[combined_text, combined_time, combined_dl],
+        )
+
         # Timer to poll model loading status and enable UI when ready
         timer = gr.Timer(value=2)
 
@@ -494,6 +679,8 @@ def build_ui() -> gr.Blocks:
             fn=check_ready,
             outputs=[load_status, audio_input, transcribe_btn],
         )
+
+        demo.queue()  # required for gr.Progress() in run_combine
 
     return demo
 
